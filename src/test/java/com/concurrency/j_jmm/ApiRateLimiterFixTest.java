@@ -14,7 +14,7 @@ public class ApiRateLimiterFixTest {
     // JUnit will run this method 1000 separate times
     @RepeatedTest(1000)
     public void testConcurrentRequests() throws InterruptedException {
-        B_ApiRateLimiterFix limiter = new B_ApiRateLimiterFix();
+        A_ApiRateLimiterFix limiter = new A_ApiRateLimiterFix(2);
         ExecutorService service = Executors.newFixedThreadPool(2);
         CountDownLatch latch = new CountDownLatch(1);
 

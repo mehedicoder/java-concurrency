@@ -1,10 +1,6 @@
 package com.concurrency.j_jmm;
 
-import org.openjdk.jcstress.annotations.Actor;
-import org.openjdk.jcstress.annotations.Expect;
-import org.openjdk.jcstress.annotations.JCStressTest;
-import org.openjdk.jcstress.annotations.Outcome;
-import org.openjdk.jcstress.annotations.State;
+import org.openjdk.jcstress.annotations.*;
 import org.openjdk.jcstress.infra.results.ZZ_Result;
 
 @JCStressTest
@@ -21,7 +17,7 @@ import org.openjdk.jcstress.infra.results.ZZ_Result;
 @Outcome(
         id = "true, true",
         expect = Expect.FORBIDDEN,
-        desc = "Both clients incorrectly acquired the single permit."
+        desc = "Both clients incorrectly acquired one shared permit."
 )
 @Outcome(
         id = "false, false",
@@ -29,10 +25,10 @@ import org.openjdk.jcstress.infra.results.ZZ_Result;
         desc = "Both clients were rejected despite one available permit."
 )
 @State
-public class A_ApiRateLimiterStressTest {
+public class A_ApiRateLimiterFixStressTest {
 
-    private final A_ApiRateLimiter limiter =
-            new A_ApiRateLimiter(1);
+    private final A_ApiRateLimiterFix limiter =
+            new A_ApiRateLimiterFix(1);
 
     @Actor
     public void clientRequestA(ZZ_Result result) {

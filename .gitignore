@@ -23,3 +23,10 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Maven build artifacts
+dependency-reduced-pom.xml
+
+# jcstress results
+jcstress-results-*.bin.gz
+results/
