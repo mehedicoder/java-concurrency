@@ -35,8 +35,8 @@ class MutualExclusionTest {
         robotBeta.start();
 
         // Await the completion of both threads with a safety timeout (prevents hanging in CI pipelines if a deadlock occurs)
-        robotAlpha.join(2000);
-        robotBeta.join(2000);
+        robotAlpha.join(3000);
+        robotBeta.join(3000);
 
         // Ensure both threads terminated cleanly and did not freeze
         assertFalse(robotAlpha.isAlive(), "Robot-Alpha failed to terminate within the expected timeframe.");

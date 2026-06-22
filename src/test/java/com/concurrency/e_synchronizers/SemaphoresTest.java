@@ -113,7 +113,10 @@ class SemaphoresTest {
         Airplane p1 = new Airplane("Blocker-1");
         Airplane p2 = new Airplane("Blocker-2");
         Airplane p3 = new Airplane("Blocker-3");
-        p1.start(); p2.start(); p3.start();
+
+        p1.start();
+        p2.start();
+        p3.start();
 
         Thread.sleep(100); // Ensure they consume all 3 gate positions
 
@@ -132,7 +135,12 @@ class SemaphoresTest {
                 "The airplane thread failed to shut down or hang-vented when receiving an interrupt signal.");
 
         // Clean up remaining threads
-        p1.interrupt(); p2.interrupt(); p3.interrupt();
-        p1.join(1000); p2.join(1000); p3.join(1000);
+        p1.interrupt();
+        p2.interrupt();
+        p3.interrupt();
+
+        p1.join(1000);
+        p2.join(1000);
+        p3.join(1000);
     }
 }

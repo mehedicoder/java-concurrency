@@ -6,6 +6,7 @@ import java.util.concurrent.locks.ReentrantLock;
 class OrderBookStreamer extends Thread {
 
     private final Lock orderBookLock;
+    private int successfulAllocations = 0;
 
     // Shared global liquidity pool representing remaining transactions available for execution
     private static int unallocatedTradePool = 500_000;
@@ -17,8 +18,6 @@ class OrderBookStreamer extends Thread {
 
     @Override
     public void run() {
-        int successfulAllocations = 0;
-
         while (unallocatedTradePool > 0) {
             // High-frequency attempt to acquire execution rights
             orderBookLock.lock();
