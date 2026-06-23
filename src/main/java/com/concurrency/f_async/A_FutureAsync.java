@@ -1,34 +1,51 @@
 package com.concurrency.f_async;
 
+import java.util.Locale;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 class FlightPriceAnalyzer {
 
-    // Injecting the executor allows us to swap thread pools between production and testing
     private final ExecutorService executor;
 
-    public FlightPriceAnalyzer(ExecutorService executor) {
+    FlightPriceAnalyzer(ExecutorService executor) {
         this.executor = executor;
     }
 
-    /**
-     * Submits a background task to fetch prices and returns a Future receipt instantly.
-     */
-    public Future<Double> fetchPriceAsync(String airportCode, long simulateLatencyMs) {
+    Future<Double> fetchPriceAsync(
+            String airportCode,
+            long simulateLatencyMs
+    ) {
         return executor.submit(() -> {
             if (airportCode == null || airportCode.isBlank()) {
-                throw new IllegalArgumentException("Invalid airport code provided.");
+                throw new IllegalArgumentException(
+                        "Invalid airport code provided."
+                );
             }
 
-            // Simulate network processing latency
+            if (simulateLatencyMs < 0) {
+                throw new IllegalArgumentException(
+                        "Latency cannot be negative."
+                );
+            }
+
             if (simulateLatencyMs > 0) {
                 Thread.sleep(simulateLatencyMs);
             }
 
-            // Simulate a dynamic mock pricing algorithm
-            System.out.format("[%s] Fetching base flight price for the airport code %s...\n", Thread.currentThread().getName(), airportCode);
-            return switch (airportCode.toUpperCase()) {
+            String normalizedCode =
+                    airportCode.toUpperCase(Locale.ROOT);
+
+            System.out.printf(
+                    "[%s] Fetching price for %s...%n",
+                    Thread.currentThread().getName(),
+                    normalizedCode
+            );
+
+            return switch (normalizedCode) {
                 case "JFK" -> 450.00;
                 case "LAX" -> 550.00;
                 case "LHR" -> 720.00;
@@ -39,71 +56,125 @@ class FlightPriceAnalyzer {
 }
 
 class ExchangeRateProvider {
+
     private final ExecutorService executor;
 
-    public ExchangeRateProvider(ExecutorService executor) {
+    ExchangeRateProvider(ExecutorService executor) {
         this.executor = executor;
     }
 
-    public Future<Double> fetchExchangeRateAsync(String targetCurrency, long latencyMs) {
+    Future<Double> fetchExchangeRateAsync(
+            String targetCurrency,
+            long latencyMs
+    ) {
         return executor.submit(() -> {
-            System.out.format("[%s] 💱 Fetching exchange rate for %s...\n", Thread.currentThread().getName(), targetCurrency);
-            if (latencyMs > 0) Thread.sleep(latencyMs);
-            return "EUR".equalsIgnoreCase(targetCurrency) ? 0.92 : 1.0;
+            if (targetCurrency == null || targetCurrency.isBlank()) {
+                throw new IllegalArgumentException(
+                        "Target currency is required."
+                );
+            }
+
+            if (latencyMs < 0) {
+                throw new IllegalArgumentException(
+                        "Latency cannot be negative."
+                );
+            }
+
+            if (latencyMs > 0) {
+                Thread.sleep(latencyMs);
+            }
+
+            System.out.printf(
+                    "[%s] Fetching exchange rate for %s...%n",
+                    Thread.currentThread().getName(),
+                    targetCurrency
+            );
+
+            return "EUR".equalsIgnoreCase(targetCurrency)
+                    ? 0.92
+                    : 1.0;
         });
     }
 }
 
 public class A_FutureAsync {
-    public static void main(String[] args) throws Exception {
-        // Using a slightly larger pool (or a CachedThreadPool) so printing tasks
-        // don't have to wait for worker threads to die.
-        ExecutorService flightPricePool = java.util.concurrent.Executors.newFixedThreadPool(8);
+
+    public static void main(String[] args) {
+        ExecutorService executor = Executors.newFixedThreadPool(5);
 
         try {
-            FlightPriceAnalyzer analyzer = new FlightPriceAnalyzer(flightPricePool);
-            ExchangeRateProvider rateProvider = new ExchangeRateProvider(flightPricePool);
+            FlightPriceAnalyzer analyzer =
+                    new FlightPriceAnalyzer(executor);
 
-            Future<Double> jfkPriceFuture = analyzer.fetchPriceAsync("JFK", 2000);
-            Future<Double> laxPriceFuture = analyzer.fetchPriceAsync("LAX", 3000);
-            Future<Double> lhrPriceFuture = analyzer.fetchPriceAsync("LHR", 1000);
-            Future<Double> unknownPriceFuture = analyzer.fetchPriceAsync("XYZ", 1500);
+            ExchangeRateProvider rateProvider =
+                    new ExchangeRateProvider(executor);
 
-            Future<Double> rateFuture = rateProvider.fetchExchangeRateAsync("EUR", 1000);
+            Future<Double> jfk =
+                    analyzer.fetchPriceAsync("JFK", 2_000);
 
-            double exchangeRate = rateFuture.get();
-            System.out.format("\n[System Alert] Currency Conversion Rate Fixed: %.2f\n\n", exchangeRate);
+            Future<Double> lax =
+                    analyzer.fetchPriceAsync("LAX", 3_000);
 
-            System.out.println("--- Aggregated Final Conversion Matrix (Async Processing) ---");
+            Future<Double> lhr =
+                    analyzer.fetchPriceAsync("LHR", 1_000);
 
-           // Submit the ENTIRE print execution block to your existing 8-thread pool.
-           // This allows the main thread to instantly bypass these 4 lines without stalling!
-            flightPricePool.submit(() -> printResultAsync("JFK", jfkPriceFuture, exchangeRate));
-            flightPricePool.submit(() -> printResultAsync("LAX", laxPriceFuture, exchangeRate));
-            flightPricePool.submit(() -> printResultAsync("LHR", lhrPriceFuture, exchangeRate));
-            flightPricePool.submit(() -> printResultAsync("XYZ", unknownPriceFuture, exchangeRate));
+            Future<Double> xyz =
+                    analyzer.fetchPriceAsync("XYZ", 1_500);
 
-            // Now your tracking loop actually has a job to do!
-            while (!jfkPriceFuture.isDone() || !laxPriceFuture.isDone() || !lhrPriceFuture.isDone() || !unknownPriceFuture.isDone()) {
-                Thread.sleep(100);
-            }
+            Future<Double> rate =
+                    rateProvider.fetchExchangeRateAsync("EUR", 1_000);
+
+            double exchangeRate = rate.get();
+
+            System.out.printf(
+                    "%nCurrency conversion rate: %.2f%n%n",
+                    exchangeRate
+            );
+
+            printResult("JFK", jfk.get(), exchangeRate);
+            printResult("LAX", lax.get(), exchangeRate);
+            printResult("LHR", lhr.get(), exchangeRate);
+            printResult("XYZ", xyz.get(), exchangeRate);
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("Flight-price workflow interrupted.");
+
+        } catch (ExecutionException e) {
+            System.err.println(
+                    "Asynchronous task failed: " + e.getCause()
+            );
 
         } finally {
-            // graceful shutdown
-            flightPricePool.shutdown();
+            shutdownExecutor(executor);
         }
     }
 
-    // Clean, Isolated Async Print Helper
-    private static void printResultAsync(String code, Future<Double> future, double rate) {
+    private static void printResult(
+            String code,
+            double basePrice,
+            double rate
+    ) {
+        System.out.printf(
+                "%s Base Price: $%.2f USD | Total: €%.2f EUR%n",
+                code,
+                basePrice,
+                basePrice * rate
+        );
+    }
+
+    private static void shutdownExecutor(
+            ExecutorService executor
+    ) {
+        executor.shutdown();
+
         try {
-            // This .get() runs inside a worker thread from flightPricePool.
-            // It safely blocks THAT background thread, leaving the main thread perfectly free.
-            double basePrice = future.get();
-            System.out.format("[%s] %s Base Price: $%.2f USD | Total: €%.2f EUR\n",
-                    Thread.currentThread().getName(), code, basePrice, (basePrice * rate));
-        } catch (Exception e) {
-            System.err.println("Failed to fetch price for " + code);
+            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 }
