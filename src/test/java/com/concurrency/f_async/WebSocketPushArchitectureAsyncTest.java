@@ -6,19 +6,23 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
@@ -27,13 +31,13 @@ class WebSocketPushArchitectureAsyncTest {
 
     private ExecutorService executor;
     private List<String> outboundMessages;
-    private List<String> logs;
+    private TestSessionRepository sessionRepository;
 
     @BeforeEach
     void setUp() {
         executor = Executors.newFixedThreadPool(4);
         outboundMessages = new CopyOnWriteArrayList<>();
-        logs = new CopyOnWriteArrayList<>();
+        sessionRepository = new TestSessionRepository();
     }
 
     @AfterEach
@@ -43,276 +47,1105 @@ class WebSocketPushArchitectureAsyncTest {
         try {
             assertTrue(
                     executor.awaitTermination(2, TimeUnit.SECONDS),
-                    "The WebSocket executor failed to terminate."
+                    "The test executor did not terminate."
             );
-        } catch (InterruptedException e) {
+        } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-
             fail(
-                    "The test thread was interrupted while shutting down the executor.",
-                    e
+                    "The test thread was interrupted during shutdown.",
+                    exception
             );
         }
     }
 
     @Test
     @DisplayName(
-            "Verify that an incoming WebSocket message is processed and delivered successfully"
+            "Registration authenticates, loads permissions, persists the session and returns a handle"
     )
-    void testIncomingMessageIsProcessedAndDelivered() {
+    void testSessionRegistrationCompletesSuccessfully() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-001");
+        WebSocketRegistrationService service =
+                createRegistrationService();
 
         // Act
-        boolean delivered = pushService.onDataReceived(
+        SessionHandle handle = service.registerSessionAsync(
                 "SESSION-001",
+                "VALID-TOKEN-001"
+        ).join();
+
+        // Assert
+        PersistedSession persisted =
+                sessionRepository.find("SESSION-001");
+
+        assertAll(
+                () -> assertEquals(
+                        "SESSION-001",
+                        handle.sessionId()
+                ),
+                () -> assertEquals(
+                        "USER-001",
+                        handle.userId()
+                ),
+                () -> assertEquals(
+                        Set.of(
+                                "WEBSOCKET_CONNECT",
+                                "CHECKOUT_EVENTS_READ"
+                        ),
+                        handle.permissions()
+                ),
+                () -> assertNotNull(handle.messageResult()),
+                () -> assertFalse(
+                        handle.messageResult().isDone()
+                ),
+                () -> assertEquals(
+                        1,
+                        service.activeSessionCount()
+                ),
+                () -> assertNotNull(persisted),
+                () -> assertEquals(
+                        "USER-001",
+                        persisted.userId()
+                ),
+                () -> assertEquals(
+                        handle.permissions(),
+                        persisted.permissions()
+                )
+        );
+    }
+
+    @Test
+    @DisplayName(
+            "Registration returns immediately while authentication continues asynchronously"
+    )
+    void testRegistrationIsAsynchronous() {
+        // Arrange
+        CountDownLatch authenticationStarted =
+                new CountDownLatch(1);
+
+        CountDownLatch releaseAuthentication =
+                new CountDownLatch(1);
+
+        AtomicReference<String> authenticationThread =
+                new AtomicReference<>();
+
+        AuthenticationService authenticationService =
+                accessToken -> CompletableFuture.supplyAsync(
+                        () -> {
+                            authenticationThread.set(
+                                    Thread.currentThread().getName()
+                            );
+
+                            authenticationStarted.countDown();
+
+                            try {
+                                releaseAuthentication.await();
+                            } catch (InterruptedException exception) {
+                                Thread.currentThread().interrupt();
+                                throw new CompletionException(exception);
+                            }
+
+                            return new AuthenticatedUser("USER-001");
+                        },
+                        executor
+                );
+
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        authenticationService,
+                        userId -> CompletableFuture.completedFuture(
+                                Set.of("WEBSOCKET_CONNECT")
+                        ),
+                        sessionRepository,
+                        String::toUpperCase,
+                        outboundMessages::add
+                );
+
+        try {
+            // Act
+            CompletableFuture<SessionHandle> registrationFuture =
+                    service.registerSessionAsync(
+                            "SESSION-ASYNC",
+                            "VALID-TOKEN"
+                    );
+
+            await()
+                    .atMost(Duration.ofSeconds(1))
+                    .until(
+                            () -> authenticationStarted.getCount() == 0
+                    );
+
+            // Assert before releasing authentication
+            assertAll(
+                    () -> assertFalse(
+                            registrationFuture.isDone(),
+                            "Registration should still be running."
+                    ),
+                    () -> assertNotEquals(
+                            Thread.currentThread().getName(),
+                            authenticationThread.get()
+                    ),
+                    () -> assertEquals(
+                            0,
+                            service.activeSessionCount(),
+                            "Local registration occurs after remote steps complete."
+                    )
+            );
+
+            releaseAuthentication.countDown();
+
+            SessionHandle handle =
+                    registrationFuture.join();
+
+            assertAll(
+                    () -> assertEquals(
+                            "SESSION-ASYNC",
+                            handle.sessionId()
+                    ),
+                    () -> assertEquals(
+                            1,
+                            service.activeSessionCount()
+                    )
+            );
+
+        } finally {
+            releaseAuthentication.countDown();
+        }
+    }
+
+    @Test
+    @DisplayName(
+            "Registration stages execute in their required sequential order"
+    )
+    void testRegistrationStagesExecuteSequentially() {
+        // Arrange
+        List<String> executionOrder =
+                new CopyOnWriteArrayList<>();
+
+        AuthenticationService authenticationService =
+                accessToken -> {
+                    executionOrder.add("authenticate");
+                    return CompletableFuture.completedFuture(
+                            new AuthenticatedUser("USER-ORDER")
+                    );
+                };
+
+        PermissionService permissionService =
+                userId -> {
+                    executionOrder.add("permissions");
+                    return CompletableFuture.completedFuture(
+                            Set.of("WEBSOCKET_CONNECT")
+                    );
+                };
+
+        SessionRepository repository =
+                new SessionRepository() {
+                    @Override
+                    public CompletableFuture<Void> saveAsync(
+                            PersistedSession session
+                    ) {
+                        executionOrder.add("persist");
+                        return CompletableFuture.completedFuture(null);
+                    }
+
+                    @Override
+                    public CompletableFuture<Void> deleteAsync(
+                            String sessionId
+                    ) {
+                        executionOrder.add("delete");
+                        return CompletableFuture.completedFuture(null);
+                    }
+                };
+
+        Function<String, String> messageProcessor =
+                message -> {
+                    executionOrder.add("process-message");
+                    return message.toUpperCase();
+                };
+
+        Consumer<String> outboundSender =
+                message -> executionOrder.add("push-message");
+
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        authenticationService,
+                        permissionService,
+                        repository,
+                        messageProcessor,
+                        outboundSender
+                );
+
+        // Act
+        SessionHandle handle = service.registerSessionAsync(
+                "SESSION-ORDER",
+                "VALID-TOKEN"
+        ).join();
+
+        service.onDataReceived(
+                "SESSION-ORDER",
+                "hello"
+        );
+
+        handle.messageResult().join();
+
+        // Assert
+        assertEquals(
+                List.of(
+                        "authenticate",
+                        "permissions",
+                        "persist",
+                        "process-message",
+                        "push-message"
+                ),
+                executionOrder
+        );
+    }
+
+    @Test
+    @DisplayName(
+            "Multiple users concurrently explicitly register their own sessions and complete their push pipelines"
+    )
+    void testMultipleUsersRegisterAndCompleteOwnSessionsConcurrently() {
+        // Arrange
+        record UserSession(
+                String accessToken,
+                String userId,
+                String sessionId,
+                String rawMessage,
+                String expectedResult
+        ) {
+        }
+
+        List<UserSession> users = List.of(
+                new UserSession(
+                        "TOKEN-101",
+                        "USER-101",
+                        "SESSION-USER-101",
+                        "message-from-user-101",
+                        "PROCESSED-MESSAGE-FROM-USER-101"
+                ),
+                new UserSession(
+                        "TOKEN-202",
+                        "USER-202",
+                        "SESSION-USER-202",
+                        "message-from-user-202",
+                        "PROCESSED-MESSAGE-FROM-USER-202"
+                ),
+                new UserSession(
+                        "TOKEN-303",
+                        "USER-303",
+                        "SESSION-USER-303",
+                        "message-from-user-303",
+                        "PROCESSED-MESSAGE-FROM-USER-303"
+                )
+        );
+
+        int userCount = users.size();
+
+        CountDownLatch allAuthenticationsStarted =
+                new CountDownLatch(userCount);
+
+        CountDownLatch releaseAuthentications =
+                new CountDownLatch(1);
+
+        CountDownLatch allMessageProcessorsStarted =
+                new CountDownLatch(userCount);
+
+        CountDownLatch releaseMessageProcessors =
+                new CountDownLatch(1);
+
+        AtomicInteger activeAuthentications =
+                new AtomicInteger();
+
+        AtomicInteger maximumAuthenticationConcurrency =
+                new AtomicInteger();
+
+        AtomicInteger activeMessageProcessors =
+                new AtomicInteger();
+
+        AtomicInteger maximumMessageProcessingConcurrency =
+                new AtomicInteger();
+
+        /*
+         * Records which user was derived from each token.
+         */
+        ConcurrentHashMap<String, String> tokenToUser =
+                new ConcurrentHashMap<>();
+
+        /*
+         * Records which message was processed on which worker thread.
+         */
+        ConcurrentHashMap<String, String> messageProcessingThreads =
+                new ConcurrentHashMap<>();
+
+        AuthenticationService authenticationService =
+                accessToken -> CompletableFuture.supplyAsync(
+                        () -> {
+                            int active =
+                                    activeAuthentications.incrementAndGet();
+
+                            maximumAuthenticationConcurrency.accumulateAndGet(
+                                    active,
+                                    Math::max
+                            );
+
+                            allAuthenticationsStarted.countDown();
+
+                            try {
+                                releaseAuthentications.await();
+
+                                String numericId =
+                                        accessToken.replace(
+                                                "TOKEN-",
+                                                ""
+                                        );
+
+                                String userId =
+                                        "USER-" + numericId;
+
+                                tokenToUser.put(
+                                        accessToken,
+                                        userId
+                                );
+
+                                return new AuthenticatedUser(userId);
+
+                            } catch (InterruptedException exception) {
+                                Thread.currentThread().interrupt();
+                                throw new CompletionException(exception);
+
+                            } finally {
+                                activeAuthentications.decrementAndGet();
+                            }
+                        },
+                        executor
+                );
+
+        PermissionService permissionService =
+                userId -> CompletableFuture.completedFuture(
+                        Set.of(
+                                "WEBSOCKET_CONNECT",
+                                "MESSAGE_READ",
+                                "OWNER_" + userId
+                        )
+                );
+
+        Function<String, String> messageProcessor =
+                rawMessage -> {
+                    int active =
+                            activeMessageProcessors.incrementAndGet();
+
+                    maximumMessageProcessingConcurrency.accumulateAndGet(
+                            active,
+                            Math::max
+                    );
+
+                    messageProcessingThreads.put(
+                            rawMessage,
+                            Thread.currentThread().getName()
+                    );
+
+                    allMessageProcessorsStarted.countDown();
+
+                    try {
+                        releaseMessageProcessors.await();
+
+                        return "PROCESSED-"
+                                + rawMessage.toUpperCase();
+
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                        throw new CompletionException(exception);
+
+                    } finally {
+                        activeMessageProcessors.decrementAndGet();
+                    }
+                };
+
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        authenticationService,
+                        permissionService,
+                        sessionRepository,
+                        messageProcessor,
+                        outboundMessages::add
+                );
+
+        try {
+            // Act 1: start all user registrations without waiting
+            List<CompletableFuture<SessionHandle>>
+                    registrationFutures =
+                    users.stream()
+                            .map(user ->
+                                    service.registerSessionAsync(
+                                            user.sessionId(),
+                                            user.accessToken()
+                                    )
+                            )
+                            .toList();
+
+            await()
+                    .atMost(Duration.ofSeconds(2))
+                    .until(
+                            () -> allAuthenticationsStarted.getCount() == 0
+                    );
+
+            /*
+             * All users are authenticating at the same time.
+             */
+            assertEquals(
+                    userCount,
+                    maximumAuthenticationConcurrency.get(),
+                    "All user registrations should overlap during authentication."
+            );
+
+            releaseAuthentications.countDown();
+
+            CompletableFuture.allOf(
+                    registrationFutures.toArray(
+                            CompletableFuture[]::new
+                    )
+            ).join();
+
+            List<SessionHandle> handles =
+                    registrationFutures.stream()
+                            .map(CompletableFuture::join)
+                            .toList();
+
+            /*
+             * Index handles by session ID, so we can verify each
+             * user/session relationship explicitly.
+             */
+            ConcurrentHashMap<String, SessionHandle>
+                    handlesBySession =
+                    new ConcurrentHashMap<>();
+
+            handles.forEach(handle ->
+                    handlesBySession.put(
+                            handle.sessionId(),
+                            handle
+                    )
+            );
+
+            // Assert user-wise registration
+            for (UserSession expected : users) {
+                SessionHandle actualHandle =
+                        handlesBySession.get(
+                                expected.sessionId()
+                        );
+
+                PersistedSession persisted =
+                        sessionRepository.find(
+                                expected.sessionId()
+                        );
+
+                assertAll(
+                        () -> assertNotNull(
+                                actualHandle,
+                                "Missing handle for "
+                                        + expected.sessionId()
+                        ),
+                        () -> assertEquals(
+                                expected.sessionId(),
+                                actualHandle.sessionId()
+                        ),
+                        () -> assertEquals(
+                                expected.userId(),
+                                actualHandle.userId()
+                        ),
+                        () -> assertTrue(
+                                actualHandle.permissions().contains(
+                                        "OWNER_" + expected.userId()
+                                )
+                        ),
+                        () -> assertEquals(
+                                expected.userId(),
+                                tokenToUser.get(
+                                        expected.accessToken()
+                                )
+                        ),
+                        () -> assertNotNull(
+                                persisted,
+                                "Session was not persisted for "
+                                        + expected.userId()
+                        ),
+                        () -> assertEquals(
+                                expected.sessionId(),
+                                persisted.sessionId()
+                        ),
+                        () -> assertEquals(
+                                expected.userId(),
+                                persisted.userId()
+                        )
+                );
+            }
+
+            assertEquals(
+                    userCount,
+                    service.activeSessionCount()
+            );
+
+            // Act 2: trigger each user's own push pipeline
+            for (UserSession user : users) {
+                boolean delivered =
+                        service.onDataReceived(
+                                user.sessionId(),
+                                user.rawMessage()
+                        );
+
+                assertTrue(
+                        delivered,
+                        "Message was not delivered for "
+                                + user.userId()
+                );
+            }
+
+            await()
+                    .atMost(Duration.ofSeconds(2))
+                    .until(
+                            () -> allMessageProcessorsStarted.getCount() == 0
+                    );
+
+            /*
+             * All users' messages are being processed concurrently.
+             */
+            assertEquals(
+                    userCount,
+                    maximumMessageProcessingConcurrency.get(),
+                    "All user push pipelines should overlap."
+            );
+
+            releaseMessageProcessors.countDown();
+
+            CompletableFuture.allOf(
+                    handles.stream()
+                            .map(SessionHandle::messageResult)
+                            .toArray(CompletableFuture[]::new)
+            ).join();
+
+            // Assert user-wise push results
+            for (UserSession expected : users) {
+                SessionHandle handle =
+                        handlesBySession.get(
+                                expected.sessionId()
+                        );
+
+                assertAll(
+                        () -> assertEquals(
+                                expected.expectedResult(),
+                                handle.messageResult().join(),
+                                "Wrong push result for "
+                                        + expected.userId()
+                        ),
+                        () -> assertTrue(
+                                outboundMessages.contains(
+                                        expected.expectedResult()
+                                ),
+                                "Outbound message missing for "
+                                        + expected.userId()
+                        ),
+                        () -> assertNotNull(
+                                messageProcessingThreads.get(
+                                        expected.rawMessage()
+                                )
+                        ),
+                        () -> assertNotEquals(
+                                Thread.currentThread().getName(),
+                                messageProcessingThreads.get(
+                                        expected.rawMessage()
+                                )
+                        )
+                );
+            }
+
+            assertAll(
+                    () -> assertEquals(
+                            userCount,
+                            outboundMessages.size()
+                    ),
+                    () -> assertEquals(
+                            0,
+                            service.activeSessionCount(),
+                            "Every one-shot user session should be removed."
+                    )
+            );
+
+        } finally {
+            releaseAuthentications.countDown();
+            releaseMessageProcessors.countDown();
+        }
+    }
+
+    @Test
+    @DisplayName(
+            "Access token, user ID and persisted session data are propagated correctly"
+    )
+    void testRegistrationDataIsPropagatedBetweenStages() {
+        // Arrange
+        AtomicReference<String> receivedToken =
+                new AtomicReference<>();
+
+        AtomicReference<String> permissionUserId =
+                new AtomicReference<>();
+
+        AtomicReference<PersistedSession> persistedSession =
+                new AtomicReference<>();
+
+        AuthenticationService authenticationService =
+                accessToken -> {
+                    receivedToken.set(accessToken);
+
+                    return CompletableFuture.completedFuture(
+                            new AuthenticatedUser("USER-PROPAGATED")
+                    );
+                };
+
+        PermissionService permissionService =
+                userId -> {
+                    permissionUserId.set(userId);
+
+                    return CompletableFuture.completedFuture(
+                            Set.of("READ", "WRITE")
+                    );
+                };
+
+        SessionRepository repository =
+                new SessionRepository() {
+                    @Override
+                    public CompletableFuture<Void> saveAsync(
+                            PersistedSession session
+                    ) {
+                        persistedSession.set(session);
+                        return CompletableFuture.completedFuture(null);
+                    }
+
+                    @Override
+                    public CompletableFuture<Void> deleteAsync(
+                            String sessionId
+                    ) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                };
+
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        authenticationService,
+                        permissionService,
+                        repository,
+                        String::toUpperCase,
+                        outboundMessages::add
+                );
+
+        // Act
+        SessionHandle handle = service.registerSessionAsync(
+                "SESSION-PROPAGATED",
+                "ACCESS-TOKEN-XYZ"
+        ).join();
+
+        // Assert
+        assertAll(
+                () -> assertEquals(
+                        "ACCESS-TOKEN-XYZ",
+                        receivedToken.get()
+                ),
+                () -> assertEquals(
+                        "USER-PROPAGATED",
+                        permissionUserId.get()
+                ),
+                () -> assertNotNull(
+                        persistedSession.get()
+                ),
+                () -> assertEquals(
+                        "SESSION-PROPAGATED",
+                        persistedSession.get().sessionId()
+                ),
+                () -> assertEquals(
+                        "USER-PROPAGATED",
+                        persistedSession.get().userId()
+                ),
+                () -> assertEquals(
+                        Set.of("READ", "WRITE"),
+                        persistedSession.get().permissions()
+                ),
+                () -> assertEquals(
+                        persistedSession.get().permissions(),
+                        handle.permissions()
+                )
+        );
+    }
+
+    @Test
+    @DisplayName(
+            "An authentication failure prevents permission loading and persistence"
+    )
+    void testAuthenticationFailureStopsRegistration() {
+        // Arrange
+        AtomicBoolean permissionServiceCalled =
+                new AtomicBoolean(false);
+
+        AtomicBoolean repositoryCalled =
+                new AtomicBoolean(false);
+
+        AuthenticationFailureException failure =
+                new AuthenticationFailureException(
+                        "Invalid WebSocket access token."
+                );
+
+        AuthenticationService authenticationService =
+                accessToken ->
+                        CompletableFuture.failedFuture(failure);
+
+        PermissionService permissionService =
+                userId -> {
+                    permissionServiceCalled.set(true);
+                    return CompletableFuture.completedFuture(Set.of());
+                };
+
+        SessionRepository repository =
+                new SessionRepository() {
+                    @Override
+                    public CompletableFuture<Void> saveAsync(
+                            PersistedSession session
+                    ) {
+                        repositoryCalled.set(true);
+                        return CompletableFuture.completedFuture(null);
+                    }
+
+                    @Override
+                    public CompletableFuture<Void> deleteAsync(
+                            String sessionId
+                    ) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                };
+
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        authenticationService,
+                        permissionService,
+                        repository,
+                        String::toUpperCase,
+                        outboundMessages::add
+                );
+
+        // Act
+        CompletableFuture<SessionHandle> registrationFuture =
+                service.registerSessionAsync(
+                        "SESSION-AUTH-FAILURE",
+                        "INVALID-TOKEN"
+                );
+
+        CompletionException exception = assertThrows(
+                CompletionException.class,
+                registrationFuture::join
+        );
+
+        // Assert
+        assertAll(
+                () -> assertSame(
+                        failure,
+                        rootCause(exception)
+                ),
+                () -> assertFalse(
+                        permissionServiceCalled.get()
+                ),
+                () -> assertFalse(
+                        repositoryCalled.get()
+                ),
+                () -> assertEquals(
+                        0,
+                        service.activeSessionCount()
+                )
+        );
+    }
+
+    @Test
+    @DisplayName(
+            "A permission-service failure prevents persistence and local registration"
+    )
+    void testPermissionFailureStopsRegistration() {
+        // Arrange
+        AtomicBoolean repositoryCalled =
+                new AtomicBoolean(false);
+
+        IllegalStateException failure =
+                new IllegalStateException(
+                        "Permission service unavailable."
+                );
+
+        PermissionService permissionService =
+                userId ->
+                        CompletableFuture.failedFuture(failure);
+
+        SessionRepository repository =
+                new SessionRepository() {
+                    @Override
+                    public CompletableFuture<Void> saveAsync(
+                            PersistedSession session
+                    ) {
+                        repositoryCalled.set(true);
+                        return CompletableFuture.completedFuture(null);
+                    }
+
+                    @Override
+                    public CompletableFuture<Void> deleteAsync(
+                            String sessionId
+                    ) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                };
+
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        token -> CompletableFuture.completedFuture(
+                                new AuthenticatedUser("USER-001")
+                        ),
+                        permissionService,
+                        repository,
+                        String::toUpperCase,
+                        outboundMessages::add
+                );
+
+        // Act
+        CompletableFuture<SessionHandle> registrationFuture =
+                service.registerSessionAsync(
+                        "SESSION-PERMISSION-FAILURE",
+                        "VALID-TOKEN"
+                );
+
+        CompletionException exception = assertThrows(
+                CompletionException.class,
+                registrationFuture::join
+        );
+
+        // Assert
+        assertAll(
+                () -> assertSame(
+                        failure,
+                        rootCause(exception)
+                ),
+                () -> assertFalse(repositoryCalled.get()),
+                () -> assertEquals(
+                        0,
+                        service.activeSessionCount()
+                )
+        );
+    }
+
+    @Test
+    @DisplayName(
+            "A repository save failure prevents local session registration"
+    )
+    void testRepositoryFailureStopsRegistration() {
+        // Arrange
+        IllegalStateException failure =
+                new IllegalStateException(
+                        "Session repository unavailable."
+                );
+
+        SessionRepository repository =
+                new SessionRepository() {
+                    @Override
+                    public CompletableFuture<Void> saveAsync(
+                            PersistedSession session
+                    ) {
+                        return CompletableFuture.failedFuture(failure);
+                    }
+
+                    @Override
+                    public CompletableFuture<Void> deleteAsync(
+                            String sessionId
+                    ) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                };
+
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        token -> CompletableFuture.completedFuture(
+                                new AuthenticatedUser("USER-001")
+                        ),
+                        userId -> CompletableFuture.completedFuture(
+                                Set.of("WEBSOCKET_CONNECT")
+                        ),
+                        repository,
+                        String::toUpperCase,
+                        outboundMessages::add
+                );
+
+        // Act
+        CompletableFuture<SessionHandle> registrationFuture =
+                service.registerSessionAsync(
+                        "SESSION-SAVE-FAILURE",
+                        "VALID-TOKEN"
+                );
+
+        CompletionException exception = assertThrows(
+                CompletionException.class,
+                registrationFuture::join
+        );
+
+        // Assert
+        assertAll(
+                () -> assertSame(
+                        failure,
+                        rootCause(exception)
+                ),
+                () -> assertEquals(
+                        0,
+                        service.activeSessionCount()
+                )
+        );
+    }
+
+    @Test
+    @DisplayName(
+            "An incoming message is processed and pushed after registration"
+    )
+    void testIncomingMessageIsProcessedAndPushed() {
+        // Arrange
+        WebSocketRegistrationService service =
+                createRegistrationService();
+
+        SessionHandle handle = service.registerSessionAsync(
+                "SESSION-MESSAGE",
+                "VALID-TOKEN"
+        ).join();
+
+        // Act
+        boolean delivered = service.onDataReceived(
+                "SESSION-MESSAGE",
                 "{ \"action\": \"checkout\" }"
         );
 
-        await()
-                .atMost(Duration.ofSeconds(2))
-                .until(resultFuture::isDone);
-
-        String result = resultFuture.join();
+        String result = handle.messageResult().join();
 
         // Assert
         assertAll(
                 () -> assertTrue(delivered),
-                () -> assertFalse(
-                        resultFuture.isCompletedExceptionally()
-                ),
-                () -> assertFalse(resultFuture.isCancelled()),
                 () -> assertEquals(
                         "Processed JSON Payload: "
                                 + "{ \"ACTION\": \"CHECKOUT\" }",
                         result
                 ),
-                () -> assertEquals(1, outboundMessages.size()),
                 () -> assertEquals(
-                        result,
-                        outboundMessages.getFirst()
+                        List.of(result),
+                        outboundMessages
                 ),
                 () -> assertEquals(
                         0,
-                        pushService.activeSessionCount()
+                        service.activeSessionCount()
                 )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that registering a session adds it to the active-session registry"
+            "Message processing runs on an executor worker thread"
     )
-    void testRegisterSessionAddsActiveSession() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        // Act
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-002");
-
-        // Assert
-        assertAll(
-                () -> assertNotNull(resultFuture),
-                () -> assertFalse(resultFuture.isDone()),
-                () -> assertTrue(
-                        pushService.hasActiveSession("SESSION-002")
-                ),
-                () -> assertEquals(
-                        1,
-                        pushService.activeSessionCount()
-                ),
-                () -> assertTrue(
-                        logs.stream().anyMatch(
-                                message -> message.contains(
-                                        "Registered listener for session: SESSION-002"
-                                )
-                        )
-                )
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that message processing runs asynchronously on an executor worker"
-    )
-    void testMessageProcessingRunsOnWorkerThread() {
+    void testMessageProcessingRunsAsynchronously() {
         // Arrange
         String testThreadName =
                 Thread.currentThread().getName();
 
-        AtomicReference<String> processingThreadName =
+        AtomicReference<String> processingThread =
                 new AtomicReference<>();
 
-        WebSocketPushService pushService =
-                new WebSocketPushService(
-                        executor,
-                        rawMessage -> {
-                            processingThreadName.set(
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        token -> CompletableFuture.completedFuture(
+                                new AuthenticatedUser("USER-001")
+                        ),
+                        userId -> CompletableFuture.completedFuture(
+                                Set.of("WEBSOCKET_CONNECT")
+                        ),
+                        sessionRepository,
+                        message -> {
+                            processingThread.set(
                                     Thread.currentThread().getName()
                             );
-                            return rawMessage.toUpperCase();
+
+                            return message.toUpperCase();
                         },
-                        outboundMessages::add,
-                        logs::add
+                        outboundMessages::add
                 );
 
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-003");
+        SessionHandle handle = service.registerSessionAsync(
+                "SESSION-THREAD",
+                "VALID-TOKEN"
+        ).join();
 
         // Act
-        pushService.onDataReceived(
-                "SESSION-003",
+        service.onDataReceived(
+                "SESSION-THREAD",
                 "hello"
         );
 
-        resultFuture.join();
+        String result = handle.messageResult().join();
 
         // Assert
         assertAll(
-                () -> assertNotNull(processingThreadName.get()),
+                () -> assertEquals("HELLO", result),
+                () -> assertNotNull(processingThread.get()),
                 () -> assertNotEquals(
                         testThreadName,
-                        processingThreadName.get()
-                ),
-                () -> assertEquals(
-                        "HELLO",
-                        resultFuture.join()
+                        processingThread.get()
                 )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that the raw payload is passed unchanged to the message processor"
-    )
-    void testRawPayloadIsPassedToMessageProcessor() {
-        // Arrange
-        AtomicReference<String> receivedPayload =
-                new AtomicReference<>();
-
-        WebSocketPushService pushService =
-                new WebSocketPushService(
-                        executor,
-                        rawPayload -> {
-                            receivedPayload.set(rawPayload);
-                            return "PROCESSED";
-                        },
-                        outboundMessages::add,
-                        logs::add
-                );
-
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-004");
-
-        String rawPayload =
-                "{ \"type\": \"payment\", \"amount\": 49.99 }";
-
-        // Act
-        pushService.onDataReceived(
-                "SESSION-004",
-                rawPayload
-        );
-
-        resultFuture.join();
-
-        // Assert
-        assertEquals(
-                rawPayload,
-                receivedPayload.get()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that the processed message is passed to the outbound sender"
-    )
-    void testProcessedMessageIsPassedToOutboundSender() {
-        // Arrange
-        AtomicReference<String> deliveredMessage =
-                new AtomicReference<>();
-
-        WebSocketPushService pushService =
-                new WebSocketPushService(
-                        executor,
-                        rawPayload -> "TRANSFORMED-" + rawPayload,
-                        deliveredMessage::set,
-                        logs::add
-                );
-
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-005");
-
-        // Act
-        pushService.onDataReceived(
-                "SESSION-005",
-                "MESSAGE"
-        );
-
-        String result = resultFuture.join();
-
-        // Assert
-        assertAll(
-                () -> assertEquals(
-                        "TRANSFORMED-MESSAGE",
-                        result
-                ),
-                () -> assertEquals(
-                        "TRANSFORMED-MESSAGE",
-                        deliveredMessage.get()
-                )
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that only the first event is delivered for a one-shot session"
+            "Only the first message is delivered for a one-shot session"
     )
     void testOnlyFirstMessageIsDelivered() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
+        WebSocketRegistrationService service =
+                createRegistrationService();
 
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-006");
+        SessionHandle handle = service.registerSessionAsync(
+                "SESSION-ONE-SHOT",
+                "VALID-TOKEN"
+        ).join();
 
         // Act
-        boolean firstDelivery = pushService.onDataReceived(
-                "SESSION-006",
-                "first-message"
+        boolean firstDelivery = service.onDataReceived(
+                "SESSION-ONE-SHOT",
+                "first"
         );
 
-        boolean secondDelivery = pushService.onDataReceived(
-                "SESSION-006",
-                "second-message"
+        boolean secondDelivery = service.onDataReceived(
+                "SESSION-ONE-SHOT",
+                "second"
         );
 
-        String result = resultFuture.join();
+        String result = handle.messageResult().join();
 
         // Assert
         assertAll(
                 () -> assertTrue(firstDelivery),
                 () -> assertFalse(secondDelivery),
                 () -> assertEquals(
-                        "Processed JSON Payload: FIRST-MESSAGE",
+                        "Processed JSON Payload: FIRST",
                         result
                 ),
-                () -> assertEquals(1, outboundMessages.size())
+                () -> assertEquals(
+                        1,
+                        outboundMessages.size()
+                )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that an event for an unknown session returns false"
+            "A message for an unknown session returns false"
     )
-    void testUnknownSessionReturnsFalse() {
+    void testMessageForUnknownSessionReturnsFalse() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
+        WebSocketRegistrationService service =
+                createRegistrationService();
 
         // Act
-        boolean delivered = pushService.onDataReceived(
+        boolean delivered = service.onDataReceived(
                 "UNKNOWN-SESSION",
                 "message"
         );
@@ -320,811 +1153,979 @@ class WebSocketPushArchitectureAsyncTest {
         // Assert
         assertAll(
                 () -> assertFalse(delivered),
-                () -> assertTrue(outboundMessages.isEmpty()),
-                () -> assertEquals(
-                        0,
-                        pushService.activeSessionCount()
-                )
+                () -> assertTrue(outboundMessages.isEmpty())
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that duplicate session registration is rejected"
+            "A message processor failure completes the message future exceptionally"
     )
-    void testDuplicateSessionRegistrationIsRejected() {
+    void testMessageProcessorFailure() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        pushService.registerSession("SESSION-007");
-
-        // Act
-        DuplicateSessionException exception = assertThrows(
-                DuplicateSessionException.class,
-                () -> pushService.registerSession("SESSION-007")
-        );
-
-        // Assert
-        assertAll(
-                () -> assertEquals(
-                        "Session is already registered: SESSION-007",
-                        exception.getMessage()
-                ),
-                () -> assertEquals(
-                        1,
-                        pushService.activeSessionCount()
-                )
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that message processor failure completes the pipeline exceptionally"
-    )
-    void testMessageProcessorFailureCompletesPipelineExceptionally() {
-        // Arrange
-        WebSocketPushService pushService =
-                new WebSocketPushService(
-                        executor,
-                        rawMessage -> {
-                            throw new IllegalStateException(
-                                    "Invalid WebSocket payload."
-                            );
-                        },
-                        outboundMessages::add,
-                        logs::add
+        IllegalStateException failure =
+                new IllegalStateException(
+                        "Invalid WebSocket payload."
                 );
 
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-008");
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        token -> CompletableFuture.completedFuture(
+                                new AuthenticatedUser("USER-001")
+                        ),
+                        userId -> CompletableFuture.completedFuture(
+                                Set.of("WEBSOCKET_CONNECT")
+                        ),
+                        sessionRepository,
+                        message -> {
+                            throw failure;
+                        },
+                        outboundMessages::add
+                );
+
+        SessionHandle handle = service.registerSessionAsync(
+                "SESSION-PROCESSOR-FAILURE",
+                "VALID-TOKEN"
+        ).join();
 
         // Act
-        boolean delivered = pushService.onDataReceived(
-                "SESSION-008",
+        boolean delivered = service.onDataReceived(
+                "SESSION-PROCESSOR-FAILURE",
                 "bad-message"
         );
 
-        await()
-                .atMost(Duration.ofSeconds(2))
-                .until(resultFuture::isDone);
-
         CompletionException exception = assertThrows(
                 CompletionException.class,
-                resultFuture::join
+                handle.messageResult()::join
         );
-
-        Throwable cause = rootCause(exception);
 
         // Assert
         assertAll(
                 () -> assertTrue(delivered),
-                () -> assertTrue(
-                        resultFuture.isCompletedExceptionally()
-                ),
-                () -> assertInstanceOf(
-                        IllegalStateException.class,
-                        cause
-                ),
-                () -> assertEquals(
-                        "Invalid WebSocket payload.",
-                        cause.getMessage()
+                () -> assertSame(
+                        failure,
+                        rootCause(exception)
                 ),
                 () -> assertTrue(outboundMessages.isEmpty()),
                 () -> assertEquals(
                         0,
-                        pushService.activeSessionCount()
+                        service.activeSessionCount()
                 )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that outbound sender failure completes the pipeline exceptionally"
+            "An outbound sender failure completes the message future exceptionally"
     )
-    void testOutboundSenderFailureCompletesPipelineExceptionally() {
+    void testOutboundSenderFailure() {
         // Arrange
-        WebSocketPushService pushService =
-                new WebSocketPushService(
-                        executor,
-                        String::toUpperCase,
-                        message -> {
-                            throw new IllegalStateException(
-                                    "WebSocket connection was closed."
-                            );
-                        },
-                        logs::add
+        IllegalStateException failure =
+                new IllegalStateException(
+                        "WebSocket connection closed."
                 );
 
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-009");
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        token -> CompletableFuture.completedFuture(
+                                new AuthenticatedUser("USER-001")
+                        ),
+                        userId -> CompletableFuture.completedFuture(
+                                Set.of("WEBSOCKET_CONNECT")
+                        ),
+                        sessionRepository,
+                        String::toUpperCase,
+                        message -> {
+                            throw failure;
+                        }
+                );
+
+        SessionHandle handle = service.registerSessionAsync(
+                "SESSION-SENDER-FAILURE",
+                "VALID-TOKEN"
+        ).join();
 
         // Act
-        pushService.onDataReceived(
-                "SESSION-009",
+        service.onDataReceived(
+                "SESSION-SENDER-FAILURE",
                 "hello"
         );
 
         CompletionException exception = assertThrows(
                 CompletionException.class,
-                resultFuture::join
+                handle.messageResult()::join
         );
-
-        Throwable cause = rootCause(exception);
 
         // Assert
         assertAll(
-                () -> assertTrue(
-                        resultFuture.isCompletedExceptionally()
-                ),
-                () -> assertInstanceOf(
-                        IllegalStateException.class,
-                        cause
-                ),
-                () -> assertEquals(
-                        "WebSocket connection was closed.",
-                        cause.getMessage()
+                () -> assertSame(
+                        failure,
+                        rootCause(exception)
                 ),
                 () -> assertEquals(
                         0,
-                        pushService.activeSessionCount()
+                        service.activeSessionCount()
                 )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that a socket failure completes the session exceptionally"
+            "Duplicate local registration completes the second registration exceptionally"
     )
-    void testSessionFailureCompletesPipelineExceptionally() {
+    void testDuplicateSessionRegistrationIsRejected() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
+        WebSocketRegistrationService service =
+                createRegistrationService();
 
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-010");
-
-        RuntimeException socketFailure =
-                new RuntimeException("Remote peer disconnected.");
+        SessionHandle firstHandle =
+                service.registerSessionAsync(
+                        "SESSION-DUPLICATE",
+                        "VALID-TOKEN-1"
+                ).join();
 
         // Act
-        boolean completed =
-                pushService.onSessionFailure(
-                        "SESSION-010",
-                        socketFailure
+        CompletableFuture<SessionHandle> secondRegistration =
+                service.registerSessionAsync(
+                        "SESSION-DUPLICATE",
+                        "VALID-TOKEN-2"
                 );
 
         CompletionException exception = assertThrows(
                 CompletionException.class,
-                resultFuture::join
+                secondRegistration::join
         );
 
         // Assert
         assertAll(
-                () -> assertTrue(completed),
-                () -> assertTrue(
-                        resultFuture.isCompletedExceptionally()
-                ),
-                () -> assertSame(
-                        socketFailure,
+                () -> assertInstanceOf(
+                        DuplicateSessionException.class,
                         rootCause(exception)
                 ),
-                () -> assertTrue(outboundMessages.isEmpty()),
                 () -> assertEquals(
-                        0,
-                        pushService.activeSessionCount()
+                        "Session is already registered: SESSION-DUPLICATE",
+                        rootCause(exception).getMessage()
+                ),
+                () -> assertEquals(
+                        1,
+                        service.activeSessionCount()
+                ),
+                () -> assertFalse(
+                        firstHandle.messageResult().isDone()
                 )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that failure notification for an unknown session returns false"
+            "Disconnecting an active session cancels the message pipeline and deletes persistence"
     )
-    void testFailureForUnknownSessionReturnsFalse() {
+    void testDisconnectActiveSession() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
+        WebSocketRegistrationService service =
+                createRegistrationService();
 
-        // Act
-        boolean completed = pushService.onSessionFailure(
-                "UNKNOWN-SESSION",
-                new RuntimeException("Connection error.")
+        SessionHandle handle = service.registerSessionAsync(
+                "SESSION-DISCONNECT",
+                "VALID-TOKEN"
+        ).join();
+
+        assertNotNull(
+                sessionRepository.find("SESSION-DISCONNECT")
         );
 
-        // Assert
-        assertFalse(completed);
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that disconnecting an active session completes its pipeline exceptionally with cancellation"
-    )
-    void testDisconnectSessionCancelsPipeline() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-011");
-
         // Act
-        boolean disconnected =
-                pushService.disconnectSession("SESSION-011");
+        boolean disconnected = service.disconnectSessionAsync(
+                "SESSION-DISCONNECT"
+        ).join();
 
-        await()
-                .atMost(Duration.ofSeconds(1))
-                .until(resultFuture::isDone);
-
-        CompletionException exception = assertThrows(
-                CompletionException.class,
-                resultFuture::join
-        );
 
         // Assert
         assertAll(
                 () -> assertTrue(disconnected),
-                () -> assertTrue(resultFuture.isDone()),
-                () -> assertFalse(
-                        resultFuture.isCancelled(),
-                        "Only the internal source future was directly cancelled."
-                ),
                 () -> assertTrue(
-                        resultFuture.isCompletedExceptionally()
+                        handle.messageResult().isCancelled()
                 ),
-                () -> assertInstanceOf(
+                () -> assertThrows(
                         CancellationException.class,
-                        rootCause(exception)
+                        handle.messageResult()::join
+                ),
+                () -> assertNull(
+                        sessionRepository.find("SESSION-DISCONNECT")
                 ),
                 () -> assertEquals(
                         0,
-                        pushService.activeSessionCount()
+                        service.activeSessionCount()
                 )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that disconnecting an unknown session returns false"
+            "Disconnecting an unknown session returns false"
     )
-    void testDisconnectUnknownSessionReturnsFalse() {
+    void testDisconnectUnknownSession() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
+        WebSocketRegistrationService service =
+                createRegistrationService();
 
         // Act
-        boolean disconnected =
-                pushService.disconnectSession("UNKNOWN-SESSION");
-
-        // Assert
-        assertFalse(disconnected);
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that session timeout completes the pipeline exceptionally"
-    )
-    void testSessionTimeoutCompletesPipelineExceptionally() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        // Act
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession(
-                        "SESSION-012",
-                        Duration.ofMillis(100)
-                );
-
-        await()
-                .atMost(Duration.ofSeconds(2))
-                .until(resultFuture::isDone);
-
-        CompletionException exception = assertThrows(
-                CompletionException.class,
-                resultFuture::join
-        );
+        boolean disconnected = service.disconnectSessionAsync(
+                "UNKNOWN-SESSION"
+        ).join();
 
         // Assert
         assertAll(
+                () -> assertFalse(disconnected),
                 () -> assertTrue(
-                        resultFuture.isCompletedExceptionally()
-                ),
-                () -> assertInstanceOf(
-                        TimeoutException.class,
-                        rootCause(exception)
-                ),
-                () -> assertEquals(
-                        0,
-                        pushService.activeSessionCount()
+                        sessionRepository.deletedSessionIds().isEmpty()
                 )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that data received before timeout completes successfully"
+            "Multiple registration operations can overlap"
     )
-    void testMessageBeforeTimeoutCompletesSuccessfully() {
+    void testMultipleRegistrationsCanRunConcurrently() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession(
-                        "SESSION-013",
-                        Duration.ofSeconds(1)
-                );
-
-        // Act
-        boolean delivered = pushService.onDataReceived(
-                "SESSION-013",
-                "within-deadline"
-        );
-
-        String result = resultFuture.join();
-
-        // Assert
-        assertAll(
-                () -> assertTrue(delivered),
-                () -> assertFalse(
-                        resultFuture.isCompletedExceptionally()
-                ),
-                () -> assertEquals(
-                        "Processed JSON Payload: WITHIN-DEADLINE",
-                        result
-                )
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that multiple sessions can be processed concurrently"
-    )
-    void testMultipleSessionsAreProcessedConcurrently() {
-        // Arrange
-        CountDownLatch bothProcessorsStarted =
+        CountDownLatch bothAuthenticationsStarted =
                 new CountDownLatch(2);
 
-        CountDownLatch releaseProcessors =
+        CountDownLatch releaseAuthentications =
                 new CountDownLatch(1);
 
-        AtomicInteger activeProcessors =
+        AtomicInteger activeAuthentications =
                 new AtomicInteger();
 
         AtomicInteger maximumConcurrency =
                 new AtomicInteger();
 
-        WebSocketPushService pushService =
-                new WebSocketPushService(
-                        executor,
-                        message -> {
+        AuthenticationService authenticationService =
+                accessToken -> CompletableFuture.supplyAsync(
+                        () -> {
                             int active =
-                                    activeProcessors.incrementAndGet();
+                                    activeAuthentications.incrementAndGet();
 
                             maximumConcurrency.accumulateAndGet(
                                     active,
                                     Math::max
                             );
 
-                            bothProcessorsStarted.countDown();
+                            bothAuthenticationsStarted.countDown();
 
                             try {
-                                releaseProcessors.await();
-                                return message.toUpperCase();
-                            } catch (InterruptedException e) {
+                                releaseAuthentications.await();
+                                return new AuthenticatedUser(
+                                        "USER-" + accessToken
+                                );
+                            } catch (InterruptedException exception) {
                                 Thread.currentThread().interrupt();
-                                throw new CompletionException(e);
+                                throw new CompletionException(exception);
                             } finally {
-                                activeProcessors.decrementAndGet();
+                                activeAuthentications.decrementAndGet();
                             }
                         },
-                        outboundMessages::add,
-                        logs::add
+                        executor
                 );
 
-        CompletableFuture<String> firstFuture =
-                pushService.registerSession("SESSION-A");
-
-        CompletableFuture<String> secondFuture =
-                pushService.registerSession("SESSION-B");
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        authenticationService,
+                        userId -> CompletableFuture.completedFuture(
+                                Set.of("WEBSOCKET_CONNECT")
+                        ),
+                        sessionRepository,
+                        String::toUpperCase,
+                        outboundMessages::add
+                );
 
         try {
             // Act
-            pushService.onDataReceived(
-                    "SESSION-A",
-                    "first"
-            );
+            CompletableFuture<SessionHandle> first =
+                    service.registerSessionAsync(
+                            "SESSION-A",
+                            "TOKEN-A"
+                    );
 
-            pushService.onDataReceived(
-                    "SESSION-B",
-                    "second"
-            );
+            CompletableFuture<SessionHandle> second =
+                    service.registerSessionAsync(
+                            "SESSION-B",
+                            "TOKEN-B"
+                    );
 
             await()
                     .atMost(Duration.ofSeconds(2))
                     .until(
-                            () -> bothProcessorsStarted.getCount() == 0
+                            () -> bothAuthenticationsStarted.getCount() == 0
                     );
 
-            // Assert while both processors are blocked
+            // Assert while both are blocked
             assertEquals(
                     2,
                     maximumConcurrency.get(),
-                    "Both session messages should be processed concurrently."
+                    "Both registrations should overlap."
             );
 
-            releaseProcessors.countDown();
+            releaseAuthentications.countDown();
 
-            CompletableFuture.allOf(
-                    firstFuture,
-                    secondFuture
-            ).join();
+            CompletableFuture.allOf(first, second).join();
 
             assertAll(
                     () -> assertEquals(
-                            "FIRST",
-                            firstFuture.join()
-                    ),
-                    () -> assertEquals(
-                            "SECOND",
-                            secondFuture.join()
-                    ),
-                    () -> assertEquals(
                             2,
-                            outboundMessages.size()
+                            service.activeSessionCount()
                     ),
                     () -> assertEquals(
-                            0,
-                            pushService.activeSessionCount()
+                            "SESSION-A",
+                            first.join().sessionId()
+                    ),
+                    () -> assertEquals(
+                            "SESSION-B",
+                            second.join().sessionId()
                     )
             );
 
         } finally {
-            releaseProcessors.countDown();
+            releaseAuthentications.countDown();
         }
     }
 
     @Test
     @DisplayName(
-            "Verify that submitting processing after executor shutdown completes the pipeline exceptionally"
+            "Multiple sessions start and complete their push pipelines concurrently end-to-end"
     )
-    void testMessageProcessingAfterExecutorShutdownIsRejected() {
+    void testMultipleUsersCompleteFullPipelineConcurrently() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
+        int numberOfUsers = 3;
 
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-014");
+        CountDownLatch allAuthenticationsStarted =
+                new CountDownLatch(numberOfUsers);
 
-        executor.shutdown();
+        CountDownLatch releaseAuthentications =
+                new CountDownLatch(1);
+
+        CountDownLatch allMessageProcessorsStarted =
+                new CountDownLatch(numberOfUsers);
+
+        CountDownLatch releaseMessageProcessors =
+                new CountDownLatch(1);
+
+        AtomicInteger activeAuthentications =
+                new AtomicInteger();
+
+        AtomicInteger maximumAuthenticationConcurrency =
+                new AtomicInteger();
+
+        AtomicInteger activeMessageProcessors =
+                new AtomicInteger();
+
+        AtomicInteger maximumMessageProcessingConcurrency =
+                new AtomicInteger();
+
+        List<String> processingThreads =
+                new CopyOnWriteArrayList<>();
+
+        AuthenticationService authenticationService =
+                accessToken -> CompletableFuture.supplyAsync(
+                        () -> {
+                            int active =
+                                    activeAuthentications.incrementAndGet();
+
+                            maximumAuthenticationConcurrency.accumulateAndGet(
+                                    active,
+                                    Math::max
+                            );
+
+                            allAuthenticationsStarted.countDown();
+
+                            try {
+                                releaseAuthentications.await();
+
+                                String userNumber =
+                                        accessToken.replace(
+                                                "TOKEN-",
+                                                ""
+                                        );
+
+                                return new AuthenticatedUser(
+                                        "USER-" + userNumber
+                                );
+
+                            } catch (InterruptedException exception) {
+                                Thread.currentThread().interrupt();
+                                throw new CompletionException(exception);
+
+                            } finally {
+                                activeAuthentications.decrementAndGet();
+                            }
+                        },
+                        executor
+                );
+
+        PermissionService permissionService =
+                userId -> CompletableFuture.completedFuture(
+                        Set.of(
+                                "WEBSOCKET_CONNECT",
+                                "MESSAGE_READ",
+                                "USER_" + userId
+                        )
+                );
+
+        Function<String, String> messageProcessor =
+                rawMessage -> {
+                    int active =
+                            activeMessageProcessors.incrementAndGet();
+
+                    maximumMessageProcessingConcurrency.accumulateAndGet(
+                            active,
+                            Math::max
+                    );
+
+                    processingThreads.add(
+                            Thread.currentThread().getName()
+                    );
+
+                    allMessageProcessorsStarted.countDown();
+
+                    try {
+                        releaseMessageProcessors.await();
+
+                        return "PROCESSED-" + rawMessage.toUpperCase();
+
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                        throw new CompletionException(exception);
+
+                    } finally {
+                        activeMessageProcessors.decrementAndGet();
+                    }
+                };
+
+        WebSocketRegistrationService service =
+                createRegistrationService(
+                        authenticationService,
+                        permissionService,
+                        sessionRepository,
+                        messageProcessor,
+                        outboundMessages::add
+                );
+
+        CompletableFuture<SessionHandle> firstRegistration = null;
+        CompletableFuture<SessionHandle> secondRegistration = null;
+        CompletableFuture<SessionHandle> thirdRegistration = null;
+
+        try {
+            // Act: start three registration pipelines
+            firstRegistration =
+                    service.registerSessionAsync(
+                            "SESSION-1",
+                            "TOKEN-1"
+                    );
+
+            secondRegistration =
+                    service.registerSessionAsync(
+                            "SESSION-2",
+                            "TOKEN-2"
+                    );
+
+            thirdRegistration =
+                    service.registerSessionAsync(
+                            "SESSION-3",
+                            "TOKEN-3"
+                    );
+
+            await()
+                    .atMost(Duration.ofSeconds(2))
+                    .until(
+                            () -> allAuthenticationsStarted.getCount() == 0
+                    );
+
+            /*
+             * All three authentication operations are currently blocked,
+             * proving that registration pipelines overlap.
+             */
+            assertEquals(
+                    numberOfUsers,
+                    maximumAuthenticationConcurrency.get(),
+                    "All user authentication operations should overlap."
+            );
+
+            releaseAuthentications.countDown();
+
+            CompletableFuture.allOf(
+                    firstRegistration,
+                    secondRegistration,
+                    thirdRegistration
+            ).join();
+
+            SessionHandle firstHandle =
+                    firstRegistration.join();
+
+            SessionHandle secondHandle =
+                    secondRegistration.join();
+
+            SessionHandle thirdHandle =
+                    thirdRegistration.join();
+
+            // Verify all sessions completed registration
+            assertAll(
+                    () -> assertEquals(
+                            "USER-1",
+                            firstHandle.userId()
+                    ),
+                    () -> assertEquals(
+                            "USER-2",
+                            secondHandle.userId()
+                    ),
+                    () -> assertEquals(
+                            "USER-3",
+                            thirdHandle.userId()
+                    ),
+                    () -> assertNotNull(
+                            sessionRepository.find("SESSION-1")
+                    ),
+                    () -> assertNotNull(
+                            sessionRepository.find("SESSION-2")
+                    ),
+                    () -> assertNotNull(
+                            sessionRepository.find("SESSION-3")
+                    ),
+                    () -> assertEquals(
+                            numberOfUsers,
+                            service.activeSessionCount()
+                    )
+            );
+
+            // Trigger all three push pipelines
+            boolean firstDelivered =
+                    service.onDataReceived(
+                            "SESSION-1",
+                            "message-from-user-1"
+                    );
+
+            boolean secondDelivered =
+                    service.onDataReceived(
+                            "SESSION-2",
+                            "message-from-user-2"
+                    );
+
+            boolean thirdDelivered =
+                    service.onDataReceived(
+                            "SESSION-3",
+                            "message-from-user-3"
+                    );
+
+            await()
+                    .atMost(Duration.ofSeconds(2))
+                    .until(
+                            () -> allMessageProcessorsStarted.getCount() == 0
+                    );
+
+            /*
+             * All message processors are blocked at the same time,
+             * proving concurrent push processing.
+             */
+            assertEquals(
+                    numberOfUsers,
+                    maximumMessageProcessingConcurrency.get(),
+                    "All message-processing pipelines should overlap."
+            );
+
+            releaseMessageProcessors.countDown();
+
+            CompletableFuture.allOf(
+                    firstHandle.messageResult(),
+                    secondHandle.messageResult(),
+                    thirdHandle.messageResult()
+            ).join();
+
+            // Assert the complete multi-user lifecycle
+            assertAll(
+                    () -> assertTrue(firstDelivered),
+                    () -> assertTrue(secondDelivered),
+                    () -> assertTrue(thirdDelivered),
+
+                    () -> assertEquals(
+                            "PROCESSED-MESSAGE-FROM-USER-1",
+                            firstHandle.messageResult().join()
+                    ),
+                    () -> assertEquals(
+                            "PROCESSED-MESSAGE-FROM-USER-2",
+                            secondHandle.messageResult().join()
+                    ),
+                    () -> assertEquals(
+                            "PROCESSED-MESSAGE-FROM-USER-3",
+                            thirdHandle.messageResult().join()
+                    ),
+
+                    () -> assertEquals(
+                            numberOfUsers,
+                            outboundMessages.size()
+                    ),
+                    () -> assertTrue(
+                            outboundMessages.contains(
+                                    "PROCESSED-MESSAGE-FROM-USER-1"
+                            )
+                    ),
+                    () -> assertTrue(
+                            outboundMessages.contains(
+                                    "PROCESSED-MESSAGE-FROM-USER-2"
+                            )
+                    ),
+                    () -> assertTrue(
+                            outboundMessages.contains(
+                                    "PROCESSED-MESSAGE-FROM-USER-3"
+                            )
+                    ),
+
+                    () -> assertEquals(
+                            numberOfUsers,
+                            processingThreads.size()
+                    ),
+                    () -> assertTrue(
+                            processingThreads.stream()
+                                    .noneMatch(
+                                            threadName ->
+                                                    threadName.equals(
+                                                            Thread.currentThread()
+                                                                    .getName()
+                                                    )
+                                    ),
+                            "Message processing should not execute on the test thread."
+                    ),
+
+                    () -> assertEquals(
+                            0,
+                            service.activeSessionCount(),
+                            "All one-shot sessions should be removed after delivery."
+                    )
+            );
+
+        } finally {
+            releaseAuthentications.countDown();
+            releaseMessageProcessors.countDown();
+        }
+    }
+
+    @Test
+    @DisplayName(
+            "Null and blank session IDs are rejected synchronously"
+    )
+    void testInvalidSessionIdIsRejected() {
+        // Arrange
+        WebSocketRegistrationService service =
+                createRegistrationService();
 
         // Act
-        boolean delivered = pushService.onDataReceived(
-                "SESSION-014",
-                "message"
-        );
+        IllegalArgumentException nullException =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> service.registerSessionAsync(
+                                null,
+                                "VALID-TOKEN"
+                        )
+                );
 
-        await()
-                .atMost(Duration.ofSeconds(1))
-                .until(resultFuture::isDone);
-
-        CompletionException exception = assertThrows(
-                CompletionException.class,
-                resultFuture::join
-        );
+        IllegalArgumentException blankException =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> service.registerSessionAsync(
+                                "   ",
+                                "VALID-TOKEN"
+                        )
+                );
 
         // Assert
         assertAll(
-                () -> assertTrue(delivered),
-                () -> assertTrue(
-                        resultFuture.isCompletedExceptionally()
+                () -> assertEquals(
+                        "Session ID is required.",
+                        nullException.getMessage()
                 ),
-                () -> assertInstanceOf(
-                        RejectedExecutionException.class,
-                        rootCause(exception)
+                () -> assertEquals(
+                        "Session ID is required.",
+                        blankException.getMessage()
                 )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that blank session ID is rejected during registration"
+            "Null and blank access tokens are rejected synchronously"
     )
-    void testBlankSessionIdIsRejectedDuringRegistration() {
+    void testInvalidAccessTokenIsRejected() {
         // Arrange
-        WebSocketPushService pushService = createPushService();
+        WebSocketRegistrationService service =
+                createRegistrationService();
 
         // Act
-        IllegalArgumentException exception = assertThrows(
-                IllegalArgumentException.class,
-                () -> pushService.registerSession("   ")
-        );
+        IllegalArgumentException nullException =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> service.registerSessionAsync(
+                                "SESSION-001",
+                                null
+                        )
+                );
+
+        IllegalArgumentException blankException =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> service.registerSessionAsync(
+                                "SESSION-002",
+                                "   "
+                        )
+                );
 
         // Assert
-        assertEquals(
-                "Session ID is required.",
-                exception.getMessage()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that null session ID is rejected during registration"
-    )
-    void testNullSessionIdIsRejectedDuringRegistration() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        // Act
-        IllegalArgumentException exception = assertThrows(
-                IllegalArgumentException.class,
-                () -> pushService.registerSession(null)
-        );
-
-        // Assert
-        assertEquals(
-                "Session ID is required.",
-                exception.getMessage()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that blank payload is rejected before completing the session"
-    )
-    void testBlankPayloadIsRejected() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-015");
-
-        // Act
-        IllegalArgumentException exception = assertThrows(
-                IllegalArgumentException.class,
-                () -> pushService.onDataReceived(
-                        "SESSION-015",
-                        "   "
+        assertAll(
+                () -> assertEquals(
+                        "Access token is required.",
+                        nullException.getMessage()
+                ),
+                () -> assertEquals(
+                        "Access token is required.",
+                        blankException.getMessage()
                 )
         );
+    }
+
+    @Test
+    @DisplayName(
+            "Null and blank payloads are rejected without removing the active session"
+    )
+    void testInvalidPayloadIsRejected() {
+        // Arrange
+        WebSocketRegistrationService service =
+                createRegistrationService();
+
+        SessionHandle handle = service.registerSessionAsync(
+                "SESSION-PAYLOAD",
+                "VALID-TOKEN"
+        ).join();
+
+        // Act
+        IllegalArgumentException nullException =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> service.onDataReceived(
+                                "SESSION-PAYLOAD",
+                                null
+                        )
+                );
+
+        IllegalArgumentException blankException =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> service.onDataReceived(
+                                "SESSION-PAYLOAD",
+                                "   "
+                        )
+                );
 
         // Assert
         assertAll(
                 () -> assertEquals(
                         "Raw payload is required.",
-                        exception.getMessage()
+                        nullException.getMessage()
                 ),
-                () -> assertFalse(resultFuture.isDone()),
-                () -> assertTrue(
-                        pushService.hasActiveSession("SESSION-015")
+                () -> assertEquals(
+                        "Raw payload is required.",
+                        blankException.getMessage()
+                ),
+                () -> assertFalse(
+                        handle.messageResult().isDone()
+                ),
+                () -> assertEquals(
+                        1,
+                        service.activeSessionCount()
                 )
         );
     }
 
     @Test
     @DisplayName(
-            "Verify that null payload is rejected before completing the session"
+            "Constructor rejects null dependencies"
     )
-    void testNullPayloadIsRejected() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
+    void testConstructorRejectsNullDependencies() {
+        AuthenticationService authenticationService =
+                token -> CompletableFuture.completedFuture(
+                        new AuthenticatedUser("USER-001")
+                );
 
-        CompletableFuture<String> resultFuture =
-                pushService.registerSession("SESSION-016");
+        PermissionService permissionService =
+                userId -> CompletableFuture.completedFuture(
+                        Set.of("WEBSOCKET_CONNECT")
+                );
 
-        // Act
-        IllegalArgumentException exception = assertThrows(
-                IllegalArgumentException.class,
-                () -> pushService.onDataReceived(
-                        "SESSION-016",
-                        null
+        Function<String, String> processor =
+                String::toUpperCase;
+
+        Consumer<String> sender =
+                outboundMessages::add;
+
+        assertAll(
+                () -> assertEquals(
+                        "executor must not be null",
+                        assertThrows(
+                                NullPointerException.class,
+                                () -> new WebSocketRegistrationService(
+                                        null,
+                                        authenticationService,
+                                        permissionService,
+                                        sessionRepository,
+                                        processor,
+                                        sender
+                                )
+                        ).getMessage()
+                ),
+                () -> assertEquals(
+                        "authenticationService must not be null",
+                        assertThrows(
+                                NullPointerException.class,
+                                () -> new WebSocketRegistrationService(
+                                        executor,
+                                        null,
+                                        permissionService,
+                                        sessionRepository,
+                                        processor,
+                                        sender
+                                )
+                        ).getMessage()
+                ),
+                () -> assertEquals(
+                        "permissionService must not be null",
+                        assertThrows(
+                                NullPointerException.class,
+                                () -> new WebSocketRegistrationService(
+                                        executor,
+                                        authenticationService,
+                                        null,
+                                        sessionRepository,
+                                        processor,
+                                        sender
+                                )
+                        ).getMessage()
+                ),
+                () -> assertEquals(
+                        "sessionRepository must not be null",
+                        assertThrows(
+                                NullPointerException.class,
+                                () -> new WebSocketRegistrationService(
+                                        executor,
+                                        authenticationService,
+                                        permissionService,
+                                        null,
+                                        processor,
+                                        sender
+                                )
+                        ).getMessage()
+                ),
+                () -> assertEquals(
+                        "messageProcessor must not be null",
+                        assertThrows(
+                                NullPointerException.class,
+                                () -> new WebSocketRegistrationService(
+                                        executor,
+                                        authenticationService,
+                                        permissionService,
+                                        sessionRepository,
+                                        null,
+                                        sender
+                                )
+                        ).getMessage()
+                ),
+                () -> assertEquals(
+                        "outboundSender must not be null",
+                        assertThrows(
+                                NullPointerException.class,
+                                () -> new WebSocketRegistrationService(
+                                        executor,
+                                        authenticationService,
+                                        permissionService,
+                                        sessionRepository,
+                                        processor,
+                                        null
+                                )
+                        ).getMessage()
                 )
         );
+    }
+
+    @Test
+    @DisplayName(
+            "SessionHandle creates an immutable copy of permissions"
+    )
+    void testSessionHandleDefensivelyCopiesPermissions() {
+        // Arrange
+        Set<String> mutablePermissions =
+                ConcurrentHashMap.newKeySet();
+
+        mutablePermissions.add("READ");
+
+        CompletableFuture<String> messageResult =
+                new CompletableFuture<>();
+
+        // Act
+        SessionHandle handle = new SessionHandle(
+                "SESSION-IMMUTABLE",
+                "USER-IMMUTABLE",
+                mutablePermissions,
+                messageResult
+        );
+
+        mutablePermissions.add("WRITE");
 
         // Assert
         assertAll(
                 () -> assertEquals(
-                        "Raw payload is required.",
-                        exception.getMessage()
+                        Set.of("READ"),
+                        handle.permissions()
                 ),
-                () -> assertFalse(resultFuture.isDone()),
-                () -> assertTrue(
-                        pushService.hasActiveSession("SESSION-016")
+                () -> assertThrows(
+                        UnsupportedOperationException.class,
+                        () -> handle.permissions().add("ADMIN")
                 )
         );
     }
 
-    @Test
-    @DisplayName(
-            "Verify that timeout registration rejects a null timeout"
-    )
-    void testNullTimeoutIsRejected() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        // Act
-        NullPointerException exception = assertThrows(
-                NullPointerException.class,
-                () -> pushService.registerSession(
-                        "SESSION-017",
-                        null
-                )
-        );
-
-        // Assert
-        assertEquals(
-                "timeout must not be null",
-                exception.getMessage()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that timeout registration rejects a zero timeout"
-    )
-    void testZeroTimeoutIsRejected() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        // Act
-        IllegalArgumentException exception = assertThrows(
-                IllegalArgumentException.class,
-                () -> pushService.registerSession(
-                        "SESSION-018",
-                        Duration.ZERO
-                )
-        );
-
-        // Assert
-        assertEquals(
-                "Timeout must be positive.",
-                exception.getMessage()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that timeout registration rejects a negative timeout"
-    )
-    void testNegativeTimeoutIsRejected() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        // Act
-        IllegalArgumentException exception = assertThrows(
-                IllegalArgumentException.class,
-                () -> pushService.registerSession(
-                        "SESSION-019",
-                        Duration.ofMillis(-1)
-                )
-        );
-
-        // Assert
-        assertEquals(
-                "Timeout must be positive.",
-                exception.getMessage()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify that session failure rejects a null failure"
-    )
-    void testNullSessionFailureIsRejected() {
-        // Arrange
-        WebSocketPushService pushService = createPushService();
-
-        pushService.registerSession("SESSION-020");
-
-        // Act
-        NullPointerException exception = assertThrows(
-                NullPointerException.class,
-                () -> pushService.onSessionFailure(
-                        "SESSION-020",
-                        null
-                )
-        );
-
-        // Assert
-        assertEquals(
-                "failure must not be null",
-                exception.getMessage()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify constructor rejects a null executor"
-    )
-    void testConstructorRejectsNullExecutor() {
-        // Act
-        NullPointerException exception = assertThrows(
-                NullPointerException.class,
-                () -> new WebSocketPushService(
-                        null,
-                        String::toUpperCase,
-                        outboundMessages::add,
-                        logs::add
-                )
-        );
-
-        // Assert
-        assertEquals(
-                "executor must not be null",
-                exception.getMessage()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify constructor rejects a null message processor"
-    )
-    void testConstructorRejectsNullMessageProcessor() {
-        // Act
-        NullPointerException exception = assertThrows(
-                NullPointerException.class,
-                () -> new WebSocketPushService(
-                        executor,
-                        null,
-                        outboundMessages::add,
-                        logs::add
-                )
-        );
-
-        // Assert
-        assertEquals(
-                "messageProcessor must not be null",
-                exception.getMessage()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify constructor rejects a null outbound sender"
-    )
-    void testConstructorRejectsNullOutboundSender() {
-        // Act
-        NullPointerException exception = assertThrows(
-                NullPointerException.class,
-                () -> new WebSocketPushService(
-                        executor,
-                        String::toUpperCase,
-                        null,
-                        logs::add
-                )
-        );
-
-        // Assert
-        assertEquals(
-                "outboundSender must not be null",
-                exception.getMessage()
-        );
-    }
-
-    @Test
-    @DisplayName(
-            "Verify constructor rejects a null logger"
-    )
-    void testConstructorRejectsNullLogger() {
-        // Act
-        NullPointerException exception = assertThrows(
-                NullPointerException.class,
-                () -> new WebSocketPushService(
-                        executor,
-                        String::toUpperCase,
-                        outboundMessages::add,
-                        null
-                )
-        );
-
-        // Assert
-        assertEquals(
-                "logger must not be null",
-                exception.getMessage()
-        );
-    }
-
-    private WebSocketPushService createPushService() {
-        return new WebSocketPushService(
-                executor,
+    private WebSocketRegistrationService
+    createRegistrationService() {
+        return createRegistrationService(
+                accessToken ->
+                        CompletableFuture.completedFuture(
+                                new AuthenticatedUser("USER-001")
+                        ),
+                userId ->
+                        CompletableFuture.completedFuture(
+                                Set.of(
+                                        "WEBSOCKET_CONNECT",
+                                        "CHECKOUT_EVENTS_READ"
+                                )
+                        ),
+                sessionRepository,
                 rawMessage ->
                         "Processed JSON Payload: "
                                 + rawMessage.toUpperCase(),
-                outboundMessages::add,
-                logs::add
+                outboundMessages::add
+        );
+    }
+
+    private WebSocketRegistrationService
+    createRegistrationService(
+            AuthenticationService authenticationService,
+            PermissionService permissionService,
+            SessionRepository repository,
+            Function<String, String> messageProcessor,
+            Consumer<String> outboundSender
+    ) {
+        return new WebSocketRegistrationService(
+                executor,
+                authenticationService,
+                permissionService,
+                repository,
+                messageProcessor,
+                outboundSender
         );
     }
 
@@ -1138,5 +2139,41 @@ class WebSocketPushArchitectureAsyncTest {
         }
 
         return current;
+    }
+
+    private static final class TestSessionRepository
+            implements SessionRepository {
+
+        private final ConcurrentHashMap<String, PersistedSession>
+                sessions = new ConcurrentHashMap<>();
+
+        private final List<String> deletedSessionIds =
+                new CopyOnWriteArrayList<>();
+
+        @Override
+        public CompletableFuture<Void> saveAsync(
+                PersistedSession session
+        ) {
+            sessions.put(session.sessionId(), session);
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public CompletableFuture<Void> deleteAsync(
+                String sessionId
+        ) {
+            sessions.remove(sessionId);
+            deletedSessionIds.add(sessionId);
+
+            return CompletableFuture.completedFuture(null);
+        }
+
+        PersistedSession find(String sessionId) {
+            return sessions.get(sessionId);
+        }
+
+        List<String> deletedSessionIds() {
+            return new ArrayList<>(deletedSessionIds);
+        }
     }
 }
