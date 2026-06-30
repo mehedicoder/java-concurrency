@@ -17,10 +17,10 @@ class TravelAggregatorServiceTest {
         FlightService mockFlight = dest -> 500.00;
         HotelService mockHotel = dest -> 300.00;
 
-        TravelAggregatorService aggregator = new TravelAggregatorService(mockFlight, mockHotel);
+        G_TravelAggregatorService aggregator = new G_TravelAggregatorService(mockFlight, mockHotel);
 
         // Act
-        TravelAggregatorService.TravelPackage result =
+        G_TravelAggregatorService.TravelPackage result =
                 aggregator.compilePackage("PARIS", Duration.ofSeconds(2));
 
         // Assert
@@ -39,7 +39,7 @@ class TravelAggregatorServiceTest {
             throw new IllegalStateException("Hotel database connection dropped.");
         };
 
-        TravelAggregatorService aggregator = new TravelAggregatorService(mockFlight, mockHotel);
+        G_TravelAggregatorService aggregator = new G_TravelAggregatorService(mockFlight, mockHotel);
 
         // Act & Assert
         IllegalStateException thrown = assertThrows(IllegalStateException.class, () -> {
@@ -59,7 +59,7 @@ class TravelAggregatorServiceTest {
             return 200.00;
         };
 
-        TravelAggregatorService aggregator = new TravelAggregatorService(mockFlight, mockHotel);
+        G_TravelAggregatorService aggregator = new G_TravelAggregatorService(mockFlight, mockHotel);
 
         // Act & Assert: The framework must interrupt execution pathways and yield a TimeoutException
         assertThrows(StructuredTaskScope.TimeoutException.class, () -> {

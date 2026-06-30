@@ -4,13 +4,15 @@ import java.time.Duration;
 import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.StructuredTaskScope.Subtask;
 
-public class TravelAggregatorService {
+/**
+ * Demonstrates Scatter-gather pattern with fail-fast, all-required semantics
+ */
+public class G_TravelAggregatorService {
 
-    // Internal collaborative services decoupled for test injection
     private final FlightService flightService;
     private final HotelService hotelService;
 
-    public TravelAggregatorService(FlightService flightService, HotelService hotelService) {
+    public G_TravelAggregatorService(FlightService flightService, HotelService hotelService) {
         this.flightService = flightService;
         this.hotelService = hotelService;
     }
@@ -24,6 +26,8 @@ public class TravelAggregatorService {
     public TravelPackage compilePackage(String destination, Duration timeoutSLALimit) throws Exception {
 
         // Structured scope using Joiner ensuring complete collective success
+        // Orchestration: Parallel fan-out with all-success aggregation.
+        // Configurable shared SLA timeout.
         try (var scope = StructuredTaskScope.open(
                 StructuredTaskScope.Joiner.allSuccessfulOrThrow(),
                 cfg -> cfg.withTimeout(timeoutSLALimit).withName("travel-aggregator"))) {

@@ -6,13 +6,17 @@ import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.StructuredTaskScope.Subtask;
 import java.util.stream.Stream;
 
-public class CryptoTokenService {
+/**
+* In traditional Java concurrency (like using ExecutorService), asynchronous tasks are "fire-and-forget."
+* They have no inherent relationship to the method that started them. Structured Concurrency fixes this
+* by treating a group of related tasks as a single unit of work.
+*/
+public class B_CryptoTokenService {
 
     private final HashEngine hashEngine;
     private final ThreadFactory platformThreadFactory;
 
-    // Dependency injection makes this fully mockable and testable
-    public CryptoTokenService(HashEngine hashEngine, ThreadFactory platformThreadFactory) {
+    public B_CryptoTokenService(HashEngine hashEngine, ThreadFactory platformThreadFactory) {
         this.hashEngine = hashEngine;
         this.platformThreadFactory = platformThreadFactory;
     }
@@ -20,7 +24,7 @@ public class CryptoTokenService {
     public record SecurityPayload(String blockA, String blockB) {}
 
     public SecurityPayload generateSecureTokens(String saltData, Duration timeout) throws Exception {
-        // Force platform threads to pin tasks safely onto separate heavy OS threads
+        // Orchestration: if one task fails others fail too.
         try (var scope = StructuredTaskScope.open(
                 StructuredTaskScope.Joiner.allSuccessfulOrThrow(),
                 cfg -> cfg.withThreadFactory(platformThreadFactory).withTimeout(timeout))) {

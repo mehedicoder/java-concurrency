@@ -18,12 +18,12 @@ class MarketAnalyticsEngineTest {
         ThreadFactory testVFactory = Thread.ofVirtual().name("io-vthread-", 1).factory();
         ThreadFactory testPFactory = Thread.ofPlatform().name("cpu-pthread-", 1).factory();
 
-        MarketAnalyticsEngine engine = new MarketAnalyticsEngine(
+        D_MarketAnalyticsEngine engine = new D_MarketAnalyticsEngine(
                 fakeNetworkClient, fakeMathEngine, testVFactory, testPFactory
         );
 
         // Act
-        MarketAnalyticsEngine.MarketSignal signal = engine.generateTradeSignal("BTC", Duration.ofSeconds(2));
+        D_MarketAnalyticsEngine.MarketSignal signal = engine.generateTradeSignal("BTC", Duration.ofSeconds(2));
 
         // Assert
         assertNotNull(signal);
@@ -44,7 +44,7 @@ class MarketAnalyticsEngineTest {
         ThreadFactory testVFactory = Thread.ofVirtual().factory();
         ThreadFactory testPFactory = Thread.ofPlatform().factory();
 
-        MarketAnalyticsEngine engine = new MarketAnalyticsEngine(
+        D_MarketAnalyticsEngine engine = new D_MarketAnalyticsEngine(
                 brokenNetworkClient, fakeMathEngine, testVFactory, testPFactory
         );
 

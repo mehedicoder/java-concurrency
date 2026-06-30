@@ -5,30 +5,40 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.StructuredTaskScope.Subtask;
 
-public class MarketAnalyticsEngine {
+ /**
+ *
+ * With ExecutorService and CompletableFuture, one would have to manually manage the lifecycle
+ * of each task, handle exceptions, and ensure proper cleanup. StructuredTaskScope simplifies
+ * this by providing a structured way to manage related tasks as a single unit of work.
+ * Goal is to implement a custom solution to handle the lifecycle of a complex pipeline
+ * that involves both I/O and CPU-bound tasks.
+ */
+public class D_MarketAnalyticsEngine {
 
     private final MarketDataClient dataClient;
     private final MathAnalysisEngine mathEngine;
     private final ThreadFactory vThreadFactory;
     private final ThreadFactory pThreadFactory;
 
-    // Inject all environment dependencies to allow total determinism in Unit Tests
-    public MarketAnalyticsEngine(MarketDataClient dataClient, MathAnalysisEngine mathEngine,
-                                 ThreadFactory vThreadFactory, ThreadFactory pThreadFactory) {
+    public D_MarketAnalyticsEngine(MarketDataClient dataClient, MathAnalysisEngine mathEngine,
+                                   ThreadFactory vThreadFactory, ThreadFactory pThreadFactory) {
         this.dataClient = dataClient;
         this.mathEngine = mathEngine;
         this.vThreadFactory = vThreadFactory;
         this.pThreadFactory = pThreadFactory;
     }
 
-    public record MarketSignal(String ticker, String dataDump, String statisticalTrend) {}
-
     /**
      * Executes the combined lifecycle. Collects large data over I/O, then parses it via heavy CPU.
      */
+
+    public record MarketSignal(String ticker, String dataDump, String statisticalTrend) {}
+
     public MarketSignal generateTradeSignal(String ticker, Duration deadline) throws Exception {
 
         // PARENT SCOPE: Dedicated to I/O-heavy tasks via lightweight Virtual Threads
+        // Orchestration: If any task fails, the scope throws an exception.
+        // Successful tasks are joined and their results are returned.
         try (var ioScope = StructuredTaskScope.open(
                 StructuredTaskScope.Joiner.allSuccessfulOrThrow(),
                 cfg -> cfg.withThreadFactory(vThreadFactory).withTimeout(deadline))) {
@@ -43,6 +53,8 @@ public class MarketAnalyticsEngine {
             String rawJsonDump = primarySource.get();
 
             // NESTED CHILD SCOPE: Spawned specifically to pin CPU heavy math onto real OS Platform threads
+            // Orchestration: If any task fails, the scope throws an exception.
+            // Successful tasks are joined and their results are returned.
             try (var cpuScope = StructuredTaskScope.open(
                     StructuredTaskScope.Joiner.allSuccessfulOrThrow(),
                     cfg -> cfg.withThreadFactory(pThreadFactory))) {

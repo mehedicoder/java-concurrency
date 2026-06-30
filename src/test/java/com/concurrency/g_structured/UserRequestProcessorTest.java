@@ -12,7 +12,7 @@ class UserRequestProcessorTest {
     void testScopedValueInheritanceSuccess() throws Exception {
         // Arrange
         DetailsClient fakeClient = username -> "PROFILE_PAYLOAD_FOR_" + username.toUpperCase();
-        UserRequestProcessor processor = new UserRequestProcessor(fakeClient);
+        F_UserRequestProcessor processor = new F_UserRequestProcessor(fakeClient);
 
         // Act
         String result = processor.processRequest("User_123");
@@ -26,14 +26,14 @@ class UserRequestProcessorTest {
     void testScopedValueIsUnboundAfterScopeFinishes() throws Exception {
         // Arrange
         DetailsClient instantClient = username -> "OK";
-        UserRequestProcessor processor = new UserRequestProcessor(instantClient);
+        F_UserRequestProcessor processor = new F_UserRequestProcessor(instantClient);
 
         // Act: Execute transaction block completely to evaluate cleanup
         processor.processRequest("User_777");
 
         // Assert: Outside of the dynamic 'where' method call block, reading the value must throw a failure
         assertThrows(NoSuchElementException.class, () -> {
-            UserRequestProcessor.CONTEXT_USER.get();
+            F_UserRequestProcessor.CONTEXT_USER.get();
         }, "The ScopedValue data leaked outside of its execution boundary blocks.");
     }
 }

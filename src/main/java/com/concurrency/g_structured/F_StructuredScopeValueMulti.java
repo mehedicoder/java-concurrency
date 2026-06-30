@@ -3,7 +3,12 @@ package com.concurrency.g_structured;
 import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.StructuredTaskScope.Subtask;
 
-public class SecurityContextAuditor {
+/**
+ *
+ * Demonstrates security-context propagation (multi-binding) into structured child tasks
+ * using ScopedValue and StructuredTaskScope in Java 25.
+ */
+public class F_StructuredScopeValueMulti {
 
     public static final ScopedValue<String> PRINCIPAL = ScopedValue.newInstance();
     public static final ScopedValue<String> ROLE = ScopedValue.newInstance();
@@ -30,7 +35,7 @@ public class SecurityContextAuditor {
     }
 
     public static void main(String[] args) throws Exception {
-        String logResult = new SecurityContextAuditor().authorizeAndExecute();
+        String logResult = new F_StructuredScopeValueMulti().authorizeAndExecute();
         System.out.println(logResult);
     }
 }

@@ -3,7 +3,11 @@ package com.concurrency.g_structured;
 import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.StructuredTaskScope.Subtask;
 
-public class NestedTenantProcessor {
+ /**
+ * It addresses safe request-context propagation across concurrent child tasks, especially in a multi-tenant system.
+ *
+ */
+public class E_StructuredScopeValue {
 
     public static final ScopedValue<String> TENANT_ID = ScopedValue.newInstance();
 
@@ -15,16 +19,10 @@ public class NestedTenantProcessor {
             try (var scope = StructuredTaskScope.open(StructuredTaskScope.Joiner.allSuccessfulOrThrow())) {
 
                 // Subtask A inherits the outer context
-                Subtask<String> taskA = scope.fork(() ->
-                        "TaskA sees: " + TENANT_ID.get()
-                );
+                Subtask<String> taskA = scope.fork(() -> "TaskA sees: " + TENANT_ID.get());
 
                 // Subtask B explicit REBINDING for a specific client downstream
-                Subtask<String> taskB = scope.fork(() ->
-                        ScopedValue.where(TENANT_ID, "CLIENT_ACME").call(() ->
-                                "TaskB (Nested) sees: " + TENANT_ID.get()
-                        )
-                );
+                Subtask<String> taskB = scope.fork(() -> ScopedValue.where(TENANT_ID, "CLIENT_ACME").call(() -> "TaskB (Nested) sees: " + TENANT_ID.get()));
 
                 try {
                     scope.join();
@@ -43,6 +41,6 @@ public class NestedTenantProcessor {
     }
 
     public static void main(String[] args) throws Exception {
-        new NestedTenantProcessor().processMultiTenantWorkflow();
+        new E_StructuredScopeValue().processMultiTenantWorkflow();
     }
 }
